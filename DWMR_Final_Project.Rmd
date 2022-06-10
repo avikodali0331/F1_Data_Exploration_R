@@ -1,0 +1,449 @@
+---
+title: "DMWR Final Project: An Exploration of F1 Data"
+author: "Avi Kodali"
+date: '2022-05-05'
+output: 
+  html_document: 
+    theme: darkly
+    highlight: breezedark
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r Loading Packages, include = FALSE}
+library(tidyverse)
+library(janitor)
+library(lubridate)
+library(here)
+library(knitr)
+library(tidytext)
+library(lme4)
+```
+
+## Part 1: Ergast Data
+
+One of my biggest passions is Formula 1 racing. In fact, I have watched each and every race religiously since the start of the Covid-19 pandemic. Therefore, I thought it would be fun to work with Formula 1 data, and see what I could find through analyzing it. The first part of my final project is using the historical F1 data from https://ergast.com/mrd/. This is an API that has access to F1 data from its inception in 1950 until now. This includes things like race results, pit stop times, driver data, season data. 
+
+### Pitstop Data
+
+I decided to first look at pit stop data from this API, which has data specifically from 2011 until now. My first step was to attempt to use the API to get the pit stop data. However, this proved to be very difficult/inefficient because each query to the API for the pit stop data only allows access to the pit stop data of a specific year and round number of an F1 season. This would mean that I would have to have to combine the pit stop dataframes of roughly 200 races at some point, as well as combine that data with other data from Ergast such as constructor names, race locations, etc. Therefore, I decided to explore the site more to see if I had any other options, and I discovered that I could download the data from the Ergast database from https://ergast.com/mrd/db/. This made obtaining the dataframe I wanted more obtainable. So using the CSV database tables from Ergast, I cleaned and combined the different tables to gain my final pit stop dataframe, which part of can be seen below. 
+
+```{r Cleaning and Combining data to get Pitstop Dataframe}
+pitstops_raw <- read.csv(here("data", "pit_stops.csv")) 
+results_raw <- read.csv(here("data", "results.csv"))
+races_raw <- read.csv(here("data", "races.csv"))
+drivers_raw <- read.csv(here("data", "drivers.csv"))
+constructors_raw <- read.csv(here("data", "constructors.csv"))
+circuits_raw <- read.csv(here("data", "circuits.csv"))
+
+per_race_ids <- results_raw %>% 
+  select(raceId, driverId, constructorId)
+
+races <- races_raw %>% 
+  select(raceId, circuitId, year, round, name, date, time) %>% 
+  rename(raceName = name, raceDate = date, raceTime = time) %>% 
+  mutate(raceDate = ymd(raceDate), raceDateTime = ymd_hms(str_c(raceDate, raceTime)))
+
+drivers <- drivers_raw %>% 
+  mutate(driverName = paste(forename, surname), dob = ymd(dob)) %>% 
+  select(driverId, driverName, driverRef, code, dob, nationality) %>% 
+  rename(driverNationality = nationality, driverCode = code)
+
+constructors <- constructors_raw %>% 
+  select(constructorId, constructorRef, name, nationality) %>% 
+  rename(constructorNationality = nationality, constructorName = name) 
+
+circuits <- circuits_raw %>% 
+  select(circuitId, name, location, country, alt) %>% 
+  rename(circuitName = name, circuitLocation = location, circuitCountry = country, circuitAltitude = alt) %>% 
+  mutate(circuitAltitude = as.numeric(circuitAltitude))
+
+pitstops <- pitstops_raw %>% 
+  left_join(per_race_ids, by = c("raceId", "driverId")) %>% 
+  left_join(races, by = "raceId") %>% 
+  left_join(circuits, by = "circuitId") %>% 
+  left_join(drivers, by = "driverId") %>% 
+  left_join(constructors, by = "constructorId") %>% 
+  mutate(dateTime = ymd_hms(str_c(as.character(raceDate), time)), 
+         seconds = milliseconds / 1000) %>% 
+  select(raceName, raceDate, circuitName, circuitAltitude, dateTime, year, round, 
+         driverName, driverCode, constructorName, stop, lap, duration, milliseconds, seconds)
+
+kable(pitstops %>% head(), align = 'l')
+```
+
+Now I can save this clean pitstop dataframe into a csv file so that anyone can use it to start their own analysis. 
+
+```{r Writing the clean data frame into a CSV file, echo = TRUE}
+write.csv(pitstops, file = "pitstops_full.csv")
+```
+
+
+Now with this cleaned data, I can do some analysis to see what I can find. First I want to see which constructor have the fastest average pit stop time. 
+
+```{r Constructor with the Fastest Average Pitstop Time(with outliers)}
+kable(pitstops %>% 
+        group_by(constructorName) %>% 
+        summarise(avgPitStopTime = mean(seconds), numberOfRaces = n()) %>% 
+        arrange(avgPitStopTime) %>% 
+        head(10), align = 'l')
+```
+
+From this table, it seems that Virgin is the constructor with the fastest average pit stop time. However, a big part of this is probably because the Virgin only raced for two years(2010, 2011). I think I should also point out that there are two Lotus teams because they are technically two different teams(Lotus turned into Lotus F1 in the 2012 F1 season). Another interesting insight from this table is that most of these fastest average pit stop times are from teams that do not currently exist right now, i.e. teams that raced in the early 2010s. I think this might be because average pit stop times overall have increased from 2011 to now. However, I think it is important to note that the summary statistics for this table include outliers that could have been caused by pit stop problems, retirements, etc. Therefore, I decided to filter out these outliers and see how the results change.
+
+```{r Constructor with the Fastest Average Pitstop Time(without outliers)}
+kable(pitstops %>% 
+        filter(seconds <= 60) %>% 
+        group_by(constructorName) %>% 
+        summarise(avgPitStopTime = mean(seconds), numberOfRaces = n()) %>% 
+        arrange(avgPitStopTime) %>% 
+        head(10), align = 'l')
+```
+This table is interesting because the top three constructors with the fastest average pit stop times(Mercedes, Red Bull, Ferrari) are the top three constructors in the past decade, i.e they are the teams that mainly fought for the F1 World Championship. Furthermore, a lot of the constructors in this table are still older teams that don't race right now. With the insights from these tables, I can try plotting the data. 
+
+First, I want to see how average pit stop time has changed over time by constructor.
+
+```{r Plot of Average Pit Stop Time by Constructor}
+constructor_colors <-  c('Toro Rosso' = '#0000FF',
+                         'Mercedes' = '#6CD3BF',
+                         'Red Bull' = '#1E5BC6',
+                         'Ferrari' = '#ED1C24',
+                         'Williams' = '#37BEDD',
+                         'Force India' = '#FF80C7',
+                         'Virgin' = '#c82e37',
+                         'Renault' = '#FFD800',
+                         'McLaren' = '#F58020',
+                         'Sauber' = '#006EFF',
+                         'Lotus' = '#FFB800',
+                         'HRT' = '#b2945e',
+                         'Caterham' = '#0b361f',
+                         'Lotus F1' = '#FFB800',
+                         'Marussia' = '#6E0000',
+                         'Manor Marussia' = '#6E0000',
+                         'Haas F1 Team' = '#B6BABD',
+                         'Racing Point' = '#F596C8',
+                         'Aston Martin' = '#2D826D',
+                         'Alfa Romeo' = '#B12039',
+                         'AlphaTauri' = '#4E7C9B',
+                         'Alpine F1 Team' = '#2293D1')
+
+pitstops %>% 
+  filter(seconds <= 60) %>% 
+  group_by(constructorName, year) %>% 
+  summarise(avgPitStopTime = mean(seconds)) %>% 
+  mutate(year = ymd(year, truncated = 2L)) %>% 
+  ggplot(aes(x =  year, y = avgPitStopTime, color = constructorName)) +
+  geom_point() +
+  geom_line() +
+  scale_color_manual(values = constructor_colors) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Average Pit Stop Time from 2011 to 2022",
+       x = "Year",
+       y = "Average Pit Stop Time(seconds)",
+       color = "Constructor")
+```
+
+Note: I filtered the data to remove pit stop times above 60 seconds to get rid of any outliers that may be caused by pit stop problems, retirements, etc. 
+
+Although, there isn't a clearly visible pattern in average pit stop times over the years, overall, I would say that compared to the early 2010s, average pit stop times have slightly increased. 
+
+A plot of the average pit stop times over time without grouping by constructor might give more insights into this. 
+
+```{r Average Pit Stop Times Over Time}
+pitstops %>% 
+  filter(seconds <= 60) %>% 
+  group_by(year) %>% 
+  summarise(avgPitStopTime = mean(seconds)) %>% 
+  mutate(year = ymd(year, truncated = 2L)) %>% 
+  ggplot(aes(x = year, y = avgPitStopTime)) +
+  geom_point() +
+  geom_line() +
+  geom_smooth(method = "lm", se = FALSE) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Average Pit Stop Time from 2011 to 2022",
+       x = "Year",
+       y = "Average Pit Stop Time(seconds)")
+```
+
+Based off of this plot, it is definitely clear that compared to the early 2010s, average F1 pit stop times have increased over time. 
+
+Now I want to look at the distribution of the pit stop times by constructor. 
+
+```{r Distribution of Pit Stop Times By Constructor}
+pitstops %>% 
+  filter(seconds <= 60) %>% 
+  ggplot(aes(x = reorder(constructorName, seconds, FUN = mean), y = seconds, fill = constructorName)) +
+  geom_boxplot() +
+  scale_fill_manual(values = constructor_colors) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(angle = 90),
+        legend.position = "none",
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Distribution of Pit Stop Times By Constructor",
+       x = "Constructor",
+       y = "Pit Stop Time(seconds)"
+  )
+```
+
+Based on this plot, the distribution of pit stop times for each of the constructors are pretty similar. Although there are some that are a little less consistent(bigger IQR) like the Alpine F1 Team, the IQR of all the teams is between 20 and 30 seconds. 
+
+After looking at pit stop data by constructor, I want to see if the circuit at which the race occurs affects pit stop time. To do this, I can look a scatter plot of average pit stop time by circuit.
+
+```{r Scatter Plot of Average Pit Stop Time by Circuit}
+pitstops %>% 
+  filter(seconds <= 60) %>% 
+  group_by(circuitName) %>% 
+  summarise(avgPitStopTime = mean(seconds)) %>% 
+  ggplot(aes(x = reorder(circuitName, avgPitStopTime), y = avgPitStopTime)) +
+  geom_point(color = "red") +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(angle = 90),
+        plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Average Pit Stop Time by Circuit",
+       x = "Circuit",
+       y = "Average Pit Stop TIme(seconds)")
+```
+
+There definitely is some difference for pit stop times between different circuits, although I do have to point out that Circui Park Zandvoort has the fastest average pit stop time because it is a very new circuit that only had one race in 2021. This is a pretty interesting insight. These differences could be due to the length of the pit lane at each circuit or perhaps the overall environment at each circuit(like temperature, humidity, etc.). 
+
+Now I want to see how circuit altitude affects average pit stop time. 
+
+```{r Scatter Plot of Average Pit Stop Time by Circtui Altitude}
+pitstops %>% 
+  filter(seconds <= 60, !is.na(circuitAltitude)) %>% 
+  group_by(circuitAltitude) %>% 
+  summarise(avgPitStopTime = mean(seconds)) %>% 
+  ggplot(aes(x = circuitAltitude, y = avgPitStopTime)) +
+  geom_point(color = "blue") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Average Pit Stop Time vs Altitude",
+       x = "Altitude",
+       y = "Average Pit Stop TIme(seconds)")
+```
+
+Based on the plot, it does not seem like there is a clear relationship between altitude and average pit stop time. 
+
+### 2021 F1 Season Data
+
+Having satisfied my curiosity about this pit stop data, I want to now make some plots to look at the 2021 season of F1 specifically. This was one of the closest and most controversial seasons of F1 in the turbo-hybrid era, resulting in Max Verstappen winning the Driver's World Championship after Lewis Hamilton dominated the previous four seasons. First I have to make a couple of complete, clean, dataframes to contain all of the needed data. 
+
+First, I made the driver standings dataframe for the 2021 F1 season. (Preview below)
+
+```{r Making the 2021 Season Driver Standings Dataframe}
+driver_standings_raw <- read.csv(here("data", "driver_standings.csv"))
+
+races_2021 <- races %>% 
+  filter(year == 2021)
+
+driver_standings_2021 <- driver_standings_raw %>% 
+  inner_join(races_2021, by = "raceId") %>% 
+  select(driverStandingsId, raceName, raceDate, year, round, driverId, 
+         points, position, positionText, wins, circuitId) %>% 
+  left_join(drivers, by = "driverId") %>% 
+  select(driverStandingsId, raceName, raceDate, year, round, driverName, driverCode, 
+         points, position, positionText, wins, circuitId) %>% 
+  left_join(circuits, by = "circuitId") %>% 
+  select(circuitLocation, circuitCountry, circuitName, raceName, raceDate, year, round, driverName, driverCode, points, position,
+         wins) %>% 
+  rename(city = circuitLocation, country = circuitCountry) %>% 
+  arrange(round, position)
+
+kable(driver_standings_2021 %>% head(), align = 'l')
+```
+
+Next, I made the constructor standings dataframe for the 2021 F1 season. (Preview below)
+
+```{r Making the 2021 Season Constructor Standings Dataframe}
+constructor_standings_raw <- read.csv(here("data", "constructor_standings.csv"))
+
+constructor_standings_2021 <- constructor_standings_raw %>% 
+  inner_join(races_2021, by = "raceId") %>% 
+  select(constructorStandingsId, raceName, raceDate, year, round, constructorId, points, position, positionText, wins, circuitId) %>%
+  left_join(constructors, by = "constructorId") %>% 
+  select(constructorStandingsId, raceName, raceDate, year, round, constructorName, points, position, positionText, wins, 
+         circuitId) %>% 
+  left_join(circuits, by = "circuitId") %>% 
+  select(circuitLocation, circuitCountry, circuitName, raceName, raceDate, year, 
+         round, constructorName, points, position, wins) %>% 
+  rename(city = circuitLocation, country = circuitCountry) %>% 
+  arrange(round, position)
+
+kable(constructor_standings_2021 %>% head(), align = 'l')
+```
+
+Now I can get started on working on a couple of plots. 
+
+```{r Assigning colors and lines to 2021 drivers and constructors}
+drivers_2021_colors <- c('HAM' = '#6CD3BF',
+                         'BOT' = '#6CD3BF',
+                         'VER' = '#1E5BC6',
+                         'PER' = '#1E5BC6',
+                         'LEC' = '#ED1C24',
+                         'SAI' = '#ED1C24',
+                         'RUS' = '#37BEDD',
+                         'LAT' = '#37BEDD',
+                         'NOR' = '#F58020',
+                         'RIC' = '#F58020',
+                         'MSC' = '#B6BABD',
+                         'MAZ' = '#B6BABD',
+                         'VET' = '#2D826D',
+                         'STR' = '#2D826D',
+                         'RAI' = '#B12039',
+                         'GIO' = '#B12039',
+                         'KUB' = '#B12039',
+                         'GAS' = '#4E7C9B',
+                         'TSU' = '#4E7C9B',
+                         'ALO' = '#2293D1',
+                         'OCO' = '#2293D1')
+
+drivers_2021_lines <- c('HAM' = 'solid',
+                        'BOT' = 'twodash',
+                        'VER' = 'solid',
+                        'PER' = 'twodash',
+                        'LEC' = 'solid',
+                        'SAI' = 'twodash',
+                        'RUS' = 'solid',
+                        'LAT' = 'twodash',
+                        'NOR' = 'solid',
+                        'RIC' = 'twodash',
+                        'MSC' = 'solid',
+                        'MAZ' = 'twodash',
+                        'VET' = 'solid',
+                        'STR' = 'twodash',
+                        'RAI' = 'solid',
+                        'GIO' = 'twodash',
+                        'KUB' = 'dotted',
+                        'GAS' = 'solid',
+                        'TSU' = 'twodash',
+                        'ALO' = 'solid',
+                        'OCO' = 'twodash')
+
+constructors_2021_colors <- c('Mercedes' = '#6CD3BF',
+                              'Red Bull' = '#1E5BC6',
+                              'Ferrari' = '#ED1C24',
+                              'Williams' = '#37BEDD',
+                              'McLaren' = '#F58020',
+                              'Haas F1 Team' = '#B6BABD',
+                              'Aston Martin' = '#2D826D',
+                              'Alfa Romeo' = '#B12039',
+                              'AlphaTauri' = '#4E7C9B',
+                              'Alpine F1 Team' = '#2293D1')
+```
+
+I have included the code for the F1 World Driver's championship plot because it took me a lot of time to make, and personally I am proud of it. It looks a lot like the graphs the official F1 Instagram account posted. 
+
+```{r Line Plot of 2021 F1 World Driver Championship, echo = TRUE}
+driver_standings_2021 %>% 
+  ggplot(aes(x = fct_reorder(raceName, raceDate), y = points, 
+             color = driverCode, linetype = driverCode, group = driverCode)) +
+  geom_line() +
+  scale_color_manual(values = drivers_2021_colors) +
+  scale_linetype_manual(values = drivers_2021_lines) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(angle = 90),
+        plot.title = element_text(hjust = 0.5),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8)) +
+  labs(title = "2021 F1 Driver's World Championship", 
+       y = "Points",
+       color = "Driver",
+       linetype = "Driver")
+```
+
+This plot definitely show how the driver's championship was pretty close, as the top two drivers(Hamilton and Verstappen) exchanged places in terms of points total. And that was not the only close battle, as there are several driver who were close to each other throughout the season. Let's see if we can find the same thing from the constructor's championship.
+
+```{r Line Plot of 2021 F1 World Constructor Championship}
+constructor_standings_2021 %>% 
+  ggplot(aes(x = fct_reorder(raceName, raceDate), y = points, color = constructorName, group = constructorName)) +
+  geom_line() +
+  scale_color_manual(values = constructors_2021_colors) +
+  theme_bw() +
+  theme(axis.text.x.bottom = element_text(angle = 90),
+        plot.title = element_text(hjust = 0.5),
+        axis.title.x = element_blank(),
+        legend.text = element_text(size = 8)) +
+  labs(title = "2021 F1 Constructor's World Championship", 
+       y = "Points",
+       color = "Constructor")
+```
+
+The constructor's championship was also pretty close. From the plot, there are three battles that for most of the season:  Mercedes vs. Redbull, Ferrari vs. Mclaren, and Alphatauri vs. Alpine F1 Team. Although making and fine-tuning these plots was somewhat thrilling itself, watching these battles unfold live was more thrilling.
+
+## F1 Twitter Sentiment Analysis
+
+Next I want to try and do some sentiment analysis on F1 Twitter posts. Specifically, I want to look at tweets around the time of the 2021 Abu Dhabi Grand Prix. This is because this race made the 2021 F1 season very controversial. The 2021 season of F1 was controversial because of the way the race ended, and the World Champion was decided. The last race of this season was the Abu Dhabi Grand Prix, and in this race, Hamilton was well on his way to winning the race and the championship, but in the last couple of laps, the controversial decision by the race director in regards to the safety car allowed Verstappen to catch up and overtake Hamilton rather easily. At first, I wanted to do this by scraping Twitter using the Twitter API, but this proved to be difficult because the developer account I had did not have the functionality needed to do this, and any packages in R that helped utilize the  API were not optimized for Twitter's new v2 API. Therefore, I had to find another way, and luckily I found a dataset on https://www.kaggle.com/datasets/kaushiksuresh147/formula-1-trending-tweets, which has trending F1 tweets from Twitter starting from August 2021. If I filtered this dataset to include only tweets from December 4 to December 17, this would give me a good amount of tweets around when the Abu Dhabi Grand Prix occurred(as well as for the previous grand prix that was also pretty controversial).
+
+Here, I filtered out the appropriate dates, and selected variables I thought might be useful(other than the text itself). 
+
+```{r Making Tweets Dataframe}
+f1_tweets <- read.csv(here("data", "F1_tweets.csv"))
+
+abudhabi_f1_tweets <- f1_tweets %>%
+  filter(source != "") %>% 
+  mutate(dateTime = ymd_hms(date)) %>% 
+  mutate(tweet_date = str_split(date, " ") %>% map_chr(1)) %>% 
+  mutate(tweet_date = ymd(tweet_date)) %>% 
+  filter(dateTime >= "2021-11-28 00:00:00" & dateTime <= "2021-12-17 23:59:59") %>% 
+  select(dateTime, tweet_date, text) %>% 
+  arrange(dateTime)
+
+kable(abudhabi_f1_tweets %>% head(), align = 'l')
+```
+
+Now I have to make a dataframe that follows the tidy text format. 
+
+```{r Tweets Tidy Text}
+abudhabi_f1_tweets_text <- abudhabi_f1_tweets %>% 
+  select(tweet_date, text) %>% 
+  unnest_tokens(word, text)
+
+kable(abudhabi_f1_tweets_text %>% head(), align = 'l')
+```
+
+With this tidy data, I can try and perform sentiment analysis. 
+
+```{r F1 Tweet Sentiment Analysis}
+abudhabi_sentiment <- abudhabi_f1_tweets_text %>% 
+  inner_join(get_sentiments("bing")) %>% 
+  count(tweet_date, sentiment) %>% 
+  pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) %>% 
+  mutate(sentiment = positive - negative)
+
+kable(abudhabi_sentiment, align = 'l')
+```
+
+Now with the sentiment analysis done, I can try and plot the sentiment over those couple of weeks and see if I can find anything interesting. 
+
+```{r Plotting Sentiment}
+abudhabi_sentiment %>% 
+  ggplot(aes(x = tweet_date, y = sentiment)) +
+  geom_col(fill = "#FF1801") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  labs(title = "Sentiment of Trending F1 Tweets",
+       x = "Date",
+       y = "Sentiment")
+```
+
+The plot is interesting. First, it looks like December 5 is the only outwardly negative day, which is interesting because it was the day of the Saudi Arabian Grand Prix. This negative score might be because that race was filled with a lot of crashes, and highlighting it all was contact between Verstappen and Hamilton, which could have been dirty driving. This may be why the day was negative. Another thing that is interesting is that December 12 is super positive. This might be because of the overall excitment for the last, championship deciding race. Furthermore, it does not seem like the few days after this controversial race was negative, like I thought it would be. A factor in this might be that I only used trending tweets, so those tweets might not be representative of the true sentiments on Twitter. Or maybe I made an error in the sentiment analysis process. Or maybe it simply really wasn't as controversial as I thought. 
+
+One last thing I want to try is to make a wordcloud to visualize the words from the tweets. 
+
+```{r Making Wordcloud}
+library(wordcloud)
+
+abudhabi_f1_tweets_text %>%
+  anti_join(stop_words) %>%
+  semi_join(get_sentiments("bing")) %>% 
+  count(word) %>%
+  with(wordcloud(word, n, max.words = 200))
+```
+
+From this wordcloud, one thought I had was that the context of the word might be important. Clearly, words related to winning or wins are used a lot, but in the context of that tweet, Verstappen winning might have been negative. Also, December 12 might be so positive because there was an influx of tweets proclaiming Verstappen as race winner and World Champion, so that might be why it was so positive. Furthermore, although there are a lot of positive words, there are also plenty of negative words, especially curse words. Since the occurrence of those positive words is higher, that might be why we do not have a lot of days that are clearly negative. 
+
+With this, my final project covering the exploration of F1 data is done. I found a lot of insights through my analysis of various sets of F1 data, and it was pretty enjoyable. I hope you found what I did interesting as well. 
